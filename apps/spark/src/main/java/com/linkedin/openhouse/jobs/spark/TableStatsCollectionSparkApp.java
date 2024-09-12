@@ -18,7 +18,7 @@ import org.apache.commons.cli.Option;
 @Slf4j
 public class TableStatsCollectionSparkApp extends BaseTableSparkApp {
 
-  private final Boolean skipStorageStatsCollection;
+  protected final Boolean skipStorageStatsCollection;
 
   public TableStatsCollectionSparkApp(
       String jobId, StateManager stateManager, String fqtn, Boolean skipStorageStatsCollection) {
@@ -56,7 +56,7 @@ public class TableStatsCollectionSparkApp extends BaseTableSparkApp {
             getJobId(cmdLine),
             createStateManager(cmdLine),
             cmdLine.getOptionValue("tableName"),
-            cmdLine.hasOption("skipStorageStats"));
+            Boolean.parseBoolean(cmdLine.getOptionValue("skipStorageStats", "true")));
     app.run();
   }
 }
