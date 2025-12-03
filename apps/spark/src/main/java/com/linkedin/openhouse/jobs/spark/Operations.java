@@ -16,6 +16,8 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -29,7 +31,6 @@ import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.iceberg.CatalogUtil;
-import org.apache.iceberg.ExpireSnapshots;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.StructLike;
@@ -215,7 +216,6 @@ public final class Operations implements AutoCloseable {
    * number of snapshots younger than the maxAge
    */
   public void expireSnapshots(Table table, int maxAge, String granularity, int versions) {
-    ExpireSnapshots expireSnapshotsCommand = table.expireSnapshots().cleanExpiredFiles(false);
 
     // maxAge will always be defined
     ChronoUnit timeUnitGranularity =
@@ -225,16 +225,47 @@ public final class Operations implements AutoCloseable {
         System.currentTimeMillis()
             - timeUnitGranularity.getDuration().multipliedBy(maxAge).toMillis();
     log.info("Expiring snapshots for table: {} older than {}ms", table, expireBeforeTimestampMs);
-    expireSnapshotsCommand.expireOlderThan(expireBeforeTimestampMs).commit();
 
-    if (versions > 0 && Iterators.size(table.snapshots().iterator()) > versions) {
-      log.info("Expiring snapshots for table: {} retaining last {} versions", table, versions);
-      // Note: retainLast keeps the last N snapshots that WOULD be expired, hence expireOlderThan
-      // currentTime
-      expireSnapshotsCommand
-          .expireOlderThan(System.currentTimeMillis())
-          .retainLast(versions)
-          .commit();
+    int deleteThreads =
+        Integer.parseInt(
+            spark
+                .conf()
+                .get(
+                    "spark.openhouse.expire.delete.threads",
+                    String.valueOf(Math.max(10, Runtime.getRuntime().availableProcessors()))));
+    ExecutorService deleteExecutor = Executors.newFixedThreadPool(deleteThreads);
+    try {
+      org.apache.iceberg.actions.ExpireSnapshots.Result result =
+          SparkActions.get(spark)
+              .expireSnapshots(table)
+              .option("stream-results", "true")
+              .executeDeleteWith(deleteExecutor)
+              .expireOlderThan(expireBeforeTimestampMs)
+              .execute();
+      log.info(
+          "Deleted datafiles count: {}, deleted manifestfiles count: {}, deleted manifestlistcounts: {}",
+          result.deletedDataFilesCount(),
+          result.deletedManifestsCount(),
+          result.deletedManifestListsCount());
+
+      if (versions > 0 && Iterators.size(table.snapshots().iterator()) > versions) {
+        log.info("Expiring snapshots for table: {} retaining last {} versions", table, versions);
+        org.apache.iceberg.actions.ExpireSnapshots.Result versionResult =
+            SparkActions.get(spark)
+                .expireSnapshots(table)
+                .option("stream-results", "true")
+                .executeDeleteWith(deleteExecutor)
+                .retainLast(versions)
+                .expireOlderThan(System.currentTimeMillis())
+                .execute();
+        log.info(
+            "Deleted datafiles count: {}, deleted manifestfiles count: {}, deleted manifestlistcounts: {}",
+            versionResult.deletedDataFilesCount(),
+            versionResult.deletedManifestsCount(),
+            versionResult.deletedManifestListsCount());
+      }
+    } finally {
+      deleteExecutor.shutdown();
     }
   }
 
